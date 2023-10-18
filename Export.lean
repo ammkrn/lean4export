@@ -9,11 +9,10 @@ structure State where
   visitedNames : HashMap Name Nat := .insert {} .anonymous 0
   visitedLevels : HashMap Level Nat := .insert {} .zero 0
   visitedExprs : HashMap Expr Nat := {}
+  visitedRecRules : HashMap Name Nat := {}
   visitedConstants : NameHashSet := {}
-  visitedQuot : Bool := false
 
 abbrev M := ReaderT Context <| StateT State IO
-
 def M.run (env : Environment) (act : M α) : IO α :=
   StateT.run' (s := {}) do
     ReaderT.run (r := { env }) do
@@ -78,6 +77,11 @@ partial def dumpExpr (e : Expr) : M Nat := do
     | .lit (.natVal i) => return s!"#ELN {i}"
     | .lit (.strVal s) => return s!"#ELS {s.toUTF8.toList.map uint8ToHex |> seq}"
 
+def dumpHints : ReducibilityHints → String 
+  | .opaque => "O"
+  | .abbrev => "A"
+  | .regular n => s!"R {n}"
+
 partial def dumpConstant (c : Name) : M Unit := do
   if (← get).visitedConstants.contains c then
     return
@@ -91,28 +95,33 @@ partial def dumpConstant (c : Name) : M Unit := do
       return
     dumpDeps val.type
     dumpDeps val.value
-    IO.println s!"#DEF {← dumpName c} {← dumpExpr val.type} {← dumpExpr val.value} {← seq <$> val.levelParams.mapM dumpName}"
+    IO.println s!"#DEF {← dumpName c} {← dumpExpr val.type} {← dumpExpr val.value} {dumpHints val.hints} {← seq <$> val.levelParams.mapM dumpName}"
   | .thmInfo val => do
     dumpDeps val.type
     dumpDeps val.value
-    IO.println s!"#DEF {← dumpName c} {← dumpExpr val.type} {← dumpExpr val.value} {← seq <$> val.levelParams.mapM dumpName}"
+    IO.println s!"#THM {← dumpName c} {← dumpExpr val.type} {← dumpExpr val.value} {← seq <$> val.levelParams.mapM dumpName}"
   | .opaqueInfo _ => return
-  | .quotInfo _ =>
-    -- Lean 4 uses 4 separate `Quot` declarations in the environment, but Lean 3 uses a single special declarations
-    if (← get).visitedQuot then
-      return
-    modify ({ · with visitedQuot := true })
-    -- the only dependency of the quot module
-    dumpConstant `Eq
-    IO.println s!"#QUOT"
+  | .quotInfo val =>
+    dumpDeps val.type
+    IO.println s!"#QUOT {← dumpName c} {← dumpExpr val.type} {← seq <$> val.levelParams.mapM dumpName}"
   | .inductInfo val => do
     dumpDeps val.type
     for ctor in val.ctors do
       dumpDeps ((← read).env.find? ctor |>.get!.type)
-    let ctors ← (·.join) <$> val.ctors.mapM fun ctor => return [← dumpName ctor, ← dumpExpr ((← read).env.find? ctor |>.get!.type)]
-    IO.println s!"#IND {val.numParams} {← dumpName c} {← dumpExpr val.type} {val.numCtors} {seq ctors} {← seq <$> val.levelParams.mapM dumpName}"
-  | .ctorInfo _ | .recInfo _ => return
+    let ctorNameIdxs ← val.ctors.mapM (fun ctor => dumpName ctor)
+    IO.println s!"#IND {← dumpName c} {← dumpExpr val.type} {val.numParams} {val.numCtors} {seq ctorNameIdxs} {← seq <$> val.levelParams.mapM dumpName}"
+  | .ctorInfo val =>
+    dumpDeps val.type
+    IO.println s!"#CTOR {← dumpName c} {← dumpExpr val.type} {← dumpName val.induct} {val.numParams} {val.cidx} {val.numFields} {← seq <$> val.levelParams.mapM dumpName}"
+  | .recInfo val =>
+    dumpDeps val.type
+    let k := if val.k then 1 else 0
+    let ruleIdxs ← val.rules.mapM (fun rule => dumpRecRule rule)
+    IO.println s!"#REC {← dumpName c} {← dumpExpr val.type} {k} {val.numParams} {val.numIndices} {val.numMotives} {val.numMinors} {val.rules.length} {seq ruleIdxs} {← seq <$> val.levelParams.mapM dumpName}"
 where
   dumpDeps e := do
     for c in e.getUsedConstants do
       dumpConstant c
+  dumpRecRule (rule : RecursorRule) : M Nat := getIdx rule.ctor (·.visitedRecRules) ({ · with visitedRecRules := · }) do
+    dumpDeps (rule.rhs)
+    return s!"#RR {← dumpName rule.ctor} {rule.nfields} {← dumpExpr rule.rhs}"
